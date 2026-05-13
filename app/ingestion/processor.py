@@ -33,6 +33,12 @@ qdrant_client = QdrantClient(
     api_key=settings.QDRANT_API_KEY
 )
 
+from fastapi import FastAPI, Request, BackgroundTasks
+import tempfile
+
+# Initialize FastAPI for Webhook Mode
+app = FastAPI()
+
 def upload_to_gcs(data, bucket_name: str, destination_blob_name: str, is_json: bool = False):
     """
     Uploads a file or JSON data to GCS.
@@ -48,18 +54,29 @@ def upload_to_gcs(data, bucket_name: str, destination_blob_name: str, is_json: b
             logfire.info(f"✅ Uploaded to {bucket_name}")
         except Exception as e:
             logfire.error(f"❌ GCS Upload Failed: {e}")
-            raise e
+            # We don't raise here for background tasks to prevent infinite retries by Eventarc
+            # unless it's a critical infrastructure failure.
 
-def process_file(file_path: str, filename: str, source_type: str):
+def process_file(file_path: str, filename: str, source_type: str, skip_raw_upload: bool = False):
     """
     Orchestrates the parsing, chunking, embedding, and indexing of a single file.
+    
+    Args:
+        file_path: Local path to the file
+        filename: Original name of the file
+        source_type: 'true', 'noisy', etc.
+        skip_raw_upload: Set to True if the file is ALREADY in GCS (prevents infinite loops)
     """
     with logfire.span("🚀 Processing File", file=filename, source=source_type):
         try:
-            # 1. Upload RAW file to GCS
+            # 1. Upload RAW file to GCS (Only if not already there)
             raw_gcs_path = f"{source_type}/{filename}"
-            upload_to_gcs(file_path, settings.RAW_BUCKET, raw_gcs_path)
             
+            if not skip_raw_upload:
+                upload_to_gcs(file_path, settings.RAW_BUCKET, raw_gcs_path)
+            else:
+                logfire.info(f"⏭️ Skipping RAW upload for {filename} (Already in GCS)")
+
             # 2. Extract Text based on extension
             ext = filename.lower().split('.')[-1]
             if ext == 'pdf':
@@ -85,6 +102,7 @@ def process_file(file_path: str, filename: str, source_type: str):
                 return
 
             # 4. Upload PROCESSED metadata to GCS
+            # Note: We ALWAYS write to the PROCESSED bucket, which Eventarc does NOT watch.
             processed_data = {"filename": filename, "chunks": chunks, "source_type": source_type}
             processed_gcs_path = f"{source_type}/{filename}.json"
             upload_to_gcs(processed_data, settings.PROCESSED_BUCKET, processed_gcs_path, is_json=True)
@@ -114,40 +132,78 @@ def process_file(file_path: str, filename: str, source_type: str):
         except Exception as e:
             logfire.error(f"💥 Failed to process {filename}: {e}")
 
+@app.post("/")
+async def eventarc_webhook(request: Request, background_tasks: BackgroundTasks):
+    """
+    Entry point for Google Cloud Eventarc triggers.
+    """
+    try:
+        data = await request.json()
+        
+        # Eventarc sends the GCS metadata in the payload
+        bucket = data.get("bucket")
+        name = data.get("name") # e.g. "true/my_doc.pdf"
+        
+        if not bucket or not name:
+            logfire.error("❌ Invalid Eventarc payload")
+            return {"status": "error", "message": "Invalid payload"}, 400
+
+        logfire.info(f"📡 Eventarc Triggered: {name} in {bucket}")
+
+        # 1. Deduplication / Security Check
+        # We only process files from our RAW bucket
+        if bucket != settings.RAW_BUCKET:
+            logfire.warning(f"🛑 Ignoring event from unauthorized bucket: {bucket}")
+            return {"status": "ignored"}
+
+        # 2. Extract source_type from path (e.g. "true/file.pdf" -> "true")
+        parts = name.split('/')
+        source_type = parts[0] if len(parts) > 1 else "general"
+        filename = parts[-1]
+
+        # 3. Download to temp file and process in background
+        background_tasks.add_task(process_from_gcs, bucket, name, filename, source_type)
+
+        return {"status": "accepted", "file": name}
+
+    except Exception as e:
+        logfire.error(f"❌ Webhook Error: {e}")
+        return {"status": "error"}, 500
+
+async def process_from_gcs(bucket_name: str, blob_name: str, filename: str, source_type: str):
+    """
+    Downloads a file from GCS and triggers the processing pipeline.
+    """
+    with tempfile.NamedTemporaryFile(delete=False, suffix=f"_{filename}") as temp_file:
+        try:
+            bucket = storage_client.bucket(bucket_name)
+            blob = bucket.blob(blob_name)
+            blob.download_to_filename(temp_file.name)
+            
+            # CRITICAL: We set skip_raw_upload=True to prevent the Infinite Loop!
+            process_file(temp_file.name, filename, source_type, skip_raw_upload=True)
+            
+        finally:
+            if os.path.exists(temp_file.name):
+                os.remove(temp_file.name)
+
 def run_universal_ingestion(base_dir: str, explicit_source_type: str = None, wipe: bool = False):
     """
-    Automatically scans the directory.
-    If it has subfolders, maps them to source_types.
-    If it has no subfolders, uses the explicit_source_type or infers from the folder name.
+    Automatically scans the directory for CLI usage.
     """
     with logfire.span("🌍 Universal Ingestion Started", base_directory=base_dir):
-        # Handle Collection Wipe
-        if wipe:
-            with logfire.span("🧹 Wiping Collection"):
-                if qdrant_client.collection_exists(settings.QDRANT_COLLECTION):
-                    qdrant_client.delete_collection(settings.QDRANT_COLLECTION)
-                    logfire.info(f"🗑️ Collection {settings.QDRANT_COLLECTION} deleted")
-
         # Ensure Collection Exists
         if not qdrant_client.collection_exists(settings.QDRANT_COLLECTION):
             qdrant_client.create_collection(
                 collection_name=settings.QDRANT_COLLECTION,
                 vectors_config=models.VectorParams(size=768, distance=models.Distance.COSINE)
             )
-            logfire.info(f"🆕 Created collection {settings.QDRANT_COLLECTION}")
-
+        
         # Scan for subfolders
         subdirs = [d for d in os.listdir(base_dir) if os.path.isdir(os.path.join(base_dir, d))]
         
         if not subdirs:
-            # If no subdirs, use explicit type or infer from the base directory name
-            if explicit_source_type:
-                source_type = explicit_source_type
-            else:
-                base_name = os.path.basename(os.path.normpath(base_dir)).lower()
-                source_type = "true" if "true" in base_name else "noisy" if "noisy" in base_name else "general"
-            
-            logfire.info(f"📂 No subdirectories found, processing {base_dir} as '{source_type}'")
+            source_type = explicit_source_type or "general"
             process_directory(base_dir, source_type)
         else:
             for subdir in subdirs:
@@ -156,29 +212,21 @@ def run_universal_ingestion(base_dir: str, explicit_source_type: str = None, wip
                 process_directory(dir_path, source_type)
 
 def process_directory(dir_path: str, source_type: str):
-    """
-    Processes all files in a specific directory.
-    """
-    with logfire.span("📁 Scanning Directory", path=dir_path, source=source_type):
-        files = [f for f in os.listdir(dir_path) if os.path.isfile(os.path.join(dir_path, f))]
-        logfire.info(f"🔍 Found {len(files)} files")
-        
-        for filename in files:
-            file_path = os.path.join(dir_path, filename)
-            process_file(file_path, filename, source_type)
+    files = [f for f in os.listdir(dir_path) if os.path.isfile(os.path.join(dir_path, f))]
+    for filename in files:
+        file_path = os.path.join(dir_path, filename)
+        # For CLI usage, we DO want to upload the local file to GCS
+        process_file(file_path, filename, source_type, skip_raw_upload=False)
 
 if __name__ == "__main__":
-    # Usage: python -m app.ingestion.processor [dir_path] [source_type] [--wipe]
+    # Standard CLI logic
     wipe_requested = "--wipe" in sys.argv
     clean_args = [a for a in sys.argv if a != "--wipe"]
-    
-    # Default to DATA/ if no path provided
     target_dir = clean_args[1] if len(clean_args) > 1 else "DATA"
     explicit_type = clean_args[2] if len(clean_args) > 2 else None
     
-    if not os.path.exists(target_dir):
+    if os.path.exists(target_dir):
+        run_universal_ingestion(target_dir, explicit_source_type=explicit_type, wipe=wipe_requested)
+        logfire.info("🏁 Universal Ingestion Job Completed")
+    else:
         print(f"Error: Path {target_dir} does not exist.")
-        sys.exit(1)
-        
-    run_universal_ingestion(target_dir, explicit_source_type=explicit_type, wipe=wipe_requested)
-    logfire.info("🏁 Universal Ingestion Job Completed")
