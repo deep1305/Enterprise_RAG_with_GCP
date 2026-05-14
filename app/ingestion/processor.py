@@ -57,7 +57,13 @@ def upload_to_gcs(data, bucket_name: str, destination_blob_name: str, is_json: b
             # We don't raise here for background tasks to prevent infinite retries by Eventarc
             # unless it's a critical infrastructure failure.
 
-def process_file(file_path: str, filename: str, source_type: str, skip_raw_upload: bool = False):
+def process_file(
+    file_path: str,
+    filename: str,
+    source_type: str,
+    skip_raw_upload: bool = False,
+    source_generation: str | None = None
+):
     """
     Orchestrates the parsing, chunking, embedding, and indexing of a single file.
     
@@ -76,6 +82,23 @@ def process_file(file_path: str, filename: str, source_type: str, skip_raw_uploa
                 upload_to_gcs(file_path, settings.RAW_BUCKET, raw_gcs_path)
             else:
                 logfire.info(f"⏭️ Skipping RAW upload for {filename} (Already in GCS)")
+
+            processed_gcs_path = f"{source_type}/{filename}.json"
+
+            # Idempotency guard:
+            # if this exact object generation was already processed, skip duplicate Eventarc deliveries.
+            if source_generation:
+                try:
+                    processed_blob = storage_client.bucket(settings.PROCESSED_BUCKET).blob(processed_gcs_path)
+                    if processed_blob.exists():
+                        existing_payload = json.loads(processed_blob.download_as_text())
+                        if str(existing_payload.get("source_generation")) == str(source_generation):
+                            logfire.info(
+                                f"⏭️ Duplicate event ignored for {filename} (generation={source_generation})"
+                            )
+                            return
+                except Exception as dedupe_err:
+                    logfire.warning(f"⚠️ Dedupe check failed for {filename}: {dedupe_err}")
 
             # 2. Extract Text based on extension
             ext = filename.lower().split('.')[-1]
@@ -103,17 +126,39 @@ def process_file(file_path: str, filename: str, source_type: str, skip_raw_uploa
 
             # 4. Upload PROCESSED metadata to GCS
             # Note: We ALWAYS write to the PROCESSED bucket, which Eventarc does NOT watch.
-            processed_data = {"filename": filename, "chunks": chunks, "source_type": source_type}
-            processed_gcs_path = f"{source_type}/{filename}.json"
+            processed_data = {
+                "filename": filename,
+                "chunks": chunks,
+                "source_type": source_type,
+                "source_generation": source_generation
+            }
             upload_to_gcs(processed_data, settings.PROCESSED_BUCKET, processed_gcs_path, is_json=True)
 
             # 5. Embed and Index in Qdrant
             with logfire.span("🧠 Vectorizing & Indexing"):
                 embeddings = embed_texts(chunks)
+
+                # Ensure repeated processing of the same source replaces vectors instead of duplicating them.
+                qdrant_client.delete(
+                    collection_name=settings.QDRANT_COLLECTION,
+                    points_selector=models.Filter(
+                        must=[
+                            models.FieldCondition(
+                                key="source",
+                                match=models.MatchValue(value=filename)
+                            ),
+                            models.FieldCondition(
+                                key="source_type",
+                                match=models.MatchValue(value=source_type)
+                            )
+                        ]
+                    )
+                )
+
                 points = []
                 for i, (chunk, vector) in enumerate(zip(chunks, embeddings)):
                     points.append(models.PointStruct(
-                        id=str(uuid.uuid4()),
+                        id=str(uuid.uuid5(uuid.NAMESPACE_URL, f"{source_type}:{filename}:{i}")),
                         vector=vector,
                         payload={
                             "text": chunk,
@@ -143,6 +188,7 @@ async def eventarc_webhook(request: Request, background_tasks: BackgroundTasks):
         # Eventarc sends the GCS metadata in the payload
         bucket = data.get("bucket")
         name = data.get("name") # e.g. "true/my_doc.pdf"
+        generation = data.get("generation")
         
         if not bucket or not name:
             logfire.error("❌ Invalid Eventarc payload")
@@ -162,7 +208,7 @@ async def eventarc_webhook(request: Request, background_tasks: BackgroundTasks):
         filename = parts[-1]
 
         # 3. Download to temp file and process in background
-        background_tasks.add_task(process_from_gcs, bucket, name, filename, source_type)
+        background_tasks.add_task(process_from_gcs, bucket, name, filename, source_type, generation)
 
         return {"status": "accepted", "file": name}
 
@@ -170,7 +216,13 @@ async def eventarc_webhook(request: Request, background_tasks: BackgroundTasks):
         logfire.error(f"❌ Webhook Error: {e}")
         return {"status": "error"}, 500
 
-async def process_from_gcs(bucket_name: str, blob_name: str, filename: str, source_type: str):
+async def process_from_gcs(
+    bucket_name: str,
+    blob_name: str,
+    filename: str,
+    source_type: str,
+    generation: str | None = None
+):
     """
     Downloads a file from GCS and triggers the processing pipeline.
     """
@@ -181,7 +233,13 @@ async def process_from_gcs(bucket_name: str, blob_name: str, filename: str, sour
             blob.download_to_filename(temp_file.name)
             
             # CRITICAL: We set skip_raw_upload=True to prevent the Infinite Loop!
-            process_file(temp_file.name, filename, source_type, skip_raw_upload=True)
+            process_file(
+                temp_file.name,
+                filename,
+                source_type,
+                skip_raw_upload=True,
+                source_generation=generation
+            )
             
         finally:
             if os.path.exists(temp_file.name):

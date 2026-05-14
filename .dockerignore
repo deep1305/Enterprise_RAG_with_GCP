@@ -98,3 +98,8 @@ commands.md
 
 .logfire
 
+notes.txt
+# Terraform plugin dir (Google provider .exe can be >100 MB; never commit)
+**/.terraform/
+*.tfstate
+*.tfstate.*

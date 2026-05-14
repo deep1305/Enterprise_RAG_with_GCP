@@ -1,0 +1,12 @@
+# Copy to terraform.tfvars and fill in real values (terraform.tfvars is gitignored).
+project_id          = "your-gcp-project-id"
+region              = "us-central1"
+app_name            = "enterprise-rag"
+qdrant_url          = "https://your-cluster.region.gcp.cloud.qdrant.io"
+qdrant_api_key      = "your-qdrant-api-key"
+groq_api_key        = "your-groq-api-key"
+db_password         = "your-strong-db-password"
+logfire_token       = "your-logfire-write-token"
+langsmith_api_key   = "your-langsmith-api-key"
+langsmith_project   = "your-langsmith-project"
+doc_ai_processor_id = "your-document-ai-processor-id"
